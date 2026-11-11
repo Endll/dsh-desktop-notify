@@ -1,12 +1,7 @@
 # Desktop notification bundle patch: one Host row, inserted after every bundle
-# layer this profile already loads. A patch replaces a targeted row's whole
-# `config`, so a later profile layer that retunes this plugin must restate every
-# key it keeps.
+# layer this profile already loads. Settings come from the row's Config schema,
+# so the profile layer can override any of them (a patch replaces the row's whole
+# `config`, so restate every key it keeps).
 - insert:
     - id: desktop-notify
       name: "@local/dsh-desktop-notify"
-      config:
-        # Must match the Windows AppUserModelID the Desktop install registers, so
-        # the toast is attributed to DeepSeek Harness instead of to PowerShell.
-        appId: com.deepseek.dsh
-        language: zh

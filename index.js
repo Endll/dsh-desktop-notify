@@ -11,233 +11,36 @@
  */
 
 import { spawn } from 'node:child_process'
+import z from '@deepseek-ai/schemastery'
 
 /** Loader identity of this plugin. */
 export const name = 'desktop-notify'
 
 /**
+ * Windows AppUserModelID that owns the toast. It is the Desktop install's own
+ * `dshDesktopAppId`, so every install of that build names itself the same way.
+ */
+const APP_ID = 'com.deepseek.dsh'
+
+/**
  * PowerShell's own AppUserModelID. Windows refuses a toast whose AppUserModelID
  * has no registered Start Menu shortcut, and this one exists on every install,
- * so it backs up a `appId` that the current profile cannot resolve.
+ * so it backs up a profile that cannot resolve `APP_ID`.
  */
 const POWERSHELL_APP_ID
   = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
 
-/**
- * Windows toast script, run through `-EncodedCommand`. The payload arrives as
- * base64 JSON so no notification text is ever interpolated into PowerShell
- * source, and every value that lands in the XML is escaped before it gets
- * there: the title and body as text nodes, `activation` as attributes.
- */
-const TOAST_SCRIPT = `
-$ErrorActionPreference = 'Stop'
-try {
-  [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-  [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
-  $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
-  $title = [System.Security.SecurityElement]::Escape([string]$payload.title)
-  $body = [System.Security.SecurityElement]::Escape([string]$payload.body)
-  $activation = [string]$payload.activation
-  $silent = ''
-  if (-not $payload.sound) { $silent = '<audio silent="true"/>' }
-  $focused = $false
-  if ($payload.suppressWhenFocused -and [string]$payload.focusProcessName -ne '') {
-    try {
-      Add-Type -Namespace DshNotifyFocus -Name Win32 -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint processId);'
-      $handle = [DshNotifyFocus.Win32]::GetForegroundWindow()
-      if ($handle -ne [System.IntPtr]::Zero) {
-        $foregroundId = 0
-        [void][DshNotifyFocus.Win32]::GetWindowThreadProcessId($handle, [ref]$foregroundId)
-        $foreground = Get-Process -Id $foregroundId -ErrorAction SilentlyContinue
-        if ($null -ne $foreground -and $foreground.ProcessName -eq [string]$payload.focusProcessName) { $focused = $true }
-      }
-    } catch { $focused = $false }
-  }
-  if (-not $focused) {
-    $document = New-Object Windows.Data.Xml.Dom.XmlDocument
-    $document.LoadXml("<toast$($activation) duration='short'><visual><binding template='ToastGeneric'><text>$title</text><text>$body</text></binding></visual>$silent</toast>")
-    $toast = New-Object Windows.UI.Notifications.ToastNotification $document
-    foreach ($appId in @(__APP_IDS__)) {
-      try {
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
-        break
-      } catch { }
-    }
-  }
-} catch { }
-`
+/** The only URI the Desktop shell acts on; a click hands it to the `dsh` handler. */
+const ACTIVATION_URL = 'dsh://open'
 
-/**
- * Escape one value for a double-quoted XML attribute.
- * @param value - the activation URI.
- * @returns the escaped attribute value.
- */
-function escapeXmlAttribute(value) {
-  return String(value)
-    .replace(/&/gu, '&amp;')
-    .replace(/</gu, '&lt;')
-    .replace(/>/gu, '&gt;')
-    .replace(/"/gu, '&quot;')
-}
+/** Process name whose foreground window means the user is already looking at the app. */
+const FOCUS_PROCESS_NAME = 'DeepSeek Harness'
 
+/** Delay before a finished turn is announced, so a follow-up turn cancels it. */
+const QUIET_MS = 1200
 
-/**
- * Quote one string as a PowerShell single-quoted literal.
- * @param value - literal text, possibly containing quotes.
- * @returns the quoted literal.
- */
-function quotePowerShell(value) {
-  return `'${String(value).replace(/'/gu, "''")}'`
-}
-
-/**
- * Build the complete PowerShell command for one toast.
- * @param payload - base64-encoded UTF-8 JSON payload.
- * @param appIds - AppUserModelIDs to try in order.
- * @returns the script source for `-EncodedCommand`.
- */
-function toastCommand(payload, appIds) {
-  return TOAST_SCRIPT
-    .replace('__PAYLOAD__', payload)
-    .replace('__APP_IDS__', appIds.map(quotePowerShell).join(', '))
-}
-
-/**
- * Create the notifier the plugin keeps for its whole lifetime.
- * @param options - resolved plugin configuration (`appId`, `sound`, `dedupeMs`).
- * @returns `{ send, dispose }`; `send` is synchronous and never throws.
- */
-function createNotifier(options) {
-  const children = new Set()
-  /** Most recent delivery time per dedupe key, so a repeated message stays quiet. */
-  const recent = new Map()
-
-  const launch = (command, args) => {
-    try {
-      // Not detached: a DETACHED_PROCESS console keeps PowerShell alive but
-      // makes its WinRT toast silently vanish, and a notifier that outlives the
-      // Host has nothing left to report on.
-      const child = spawn(command, args, {
-        stdio: 'ignore',
-        windowsHide: true,
-      })
-      children.add(child)
-      child.once('exit', () => children.delete(child))
-      // A missing notifier binary reports here; the notification is simply lost.
-      child.once('error', () => children.delete(child))
-    } catch {
-      // The sender process could not even be spawned; nothing else can observe it.
-    }
-  }
-
-  const deliver = ({ title, body, sound }) => {
-    if (process.platform === 'win32') {
-      // A protocol activation makes the toast clickable: Windows hands the URI
-      // to the shell, and the Desktop install registers `dsh` for it. Without
-      // an activation a bare toast click does nothing at all.
-      const activation = typeof options.activationUrl === 'string' && options.activationUrl.trim() !== ''
-        ? ` activationType="protocol" launch="${escapeXmlAttribute(options.activationUrl.trim())}"`
-        : ''
-      const payload = Buffer.from(JSON.stringify({
-        title,
-        body,
-        sound,
-        activation,
-        suppressWhenFocused: options.suppressWhenFocused === true,
-        focusProcessName: String(options.focusProcessName ?? ''),
-      }), 'utf8').toString('base64')
-      const command = toastCommand(payload, [options.appId, POWERSHELL_APP_ID])
-      launch('powershell.exe', [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-WindowStyle',
-        'Hidden',
-        '-EncodedCommand',
-        Buffer.from(command, 'utf16le').toString('base64'),
-      ])
-      return
-    }
-    if (process.platform === 'darwin') {
-      launch('osascript', ['-e', `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`])
-      return
-    }
-    launch('notify-send', ['--app-name=DeepSeek Harness', title, body])
-  }
-
-  return {
-    /**
-     * Deliver one notification unless an identical one was sent within
-     * `dedupeMs`.
-     * @param message - `key` groups repeats, plus the toast title and body.
-     */
-    send(message) {
-      const now = Date.now()
-      const dedupeKey = `${message.key}\u0000${message.title}\u0000${message.body}`
-      const previous = recent.get(dedupeKey)
-      if (previous !== undefined && now - previous < options.dedupeMs) return
-      recent.set(dedupeKey, now)
-      if (recent.size > 64) {
-        for (const [key, time] of recent) {
-          if (now - time >= options.dedupeMs) recent.delete(key)
-        }
-      }
-      deliver({ title: message.title, body: message.body, sound: options.sound })
-    },
-    /** Kill notifier processes still starting, so profile teardown leaves none behind. */
-    dispose() {
-      for (const child of children) {
-        try {
-          child.kill()
-        } catch {
-          // Already exited between the spawn and this teardown.
-        }
-      }
-      children.clear()
-      recent.clear()
-    },
-  }
-}
-
-/** Every option with its default; the Loader row's `config` overrides these. */
-const DEFAULTS = Object.freeze({
-  enabled: true,
-  /** Message language: `zh` or `en`. */
-  language: 'zh',
-  /** Windows AppUserModelID that owns the toast; see `cordis.patch.yml`. */
-  appId: 'com.deepseek.dsh',
-  /**
-   * URI a toast click activates; `''` makes the toast unclickable. The Desktop
-   * install registers the `dsh` scheme and only `dsh://open` brings its window
-   * to the front, so any other value focuses nothing.
-   */
-  activationUrl: 'dsh://open',
-  /**
-   * Skip a toast while the Desktop window owns the foreground. The notifier
-   * queries the foreground window once per delivery, so this is decided at
-   * delivery time rather than from a live focus signal in the Host.
-   */
-  suppressWhenFocused: false,
-  /** Process name (no `.exe`) whose foreground window counts as "the App". */
-  focusProcessName: 'DeepSeek Harness',
-  /** Play the Windows notification sound. */
-  sound: true,
-  /** Notify when a turn finishes. A turn the user cancelled stays silent. */
-  turnEnd: true,
-  /** Notify when the Agent asks the user a question. */
-  questions: true,
-  /** Notify when a tool call waits for the user's approval. */
-  approval: true,
-  /** Notify when a background job settles. */
-  jobs: true,
-  /** Also notify for child (subagent) sessions and their jobs. */
-  childSessions: false,
-  /** Delay before a finished turn is announced, so a follow-up turn cancels it. */
-  quietMs: 1200,
-  /** Window in which an identical message is delivered once. */
-  dedupeMs: 4000,
-})
+/** Window in which an identical message is delivered once. */
+const DEDUPE_MS = 4000
 
 /** Toast text per language. */
 const MESSAGES = {
@@ -291,6 +94,175 @@ const MAX_BODY = 240
 const MAX_LABEL = 90
 
 /**
+ * Plugin settings, rendered by the plugin's settings page and validated at
+ * activation. Everything else is fixed behavior: focus suppression, the click
+ * URI, the owning AppUserModelID, the turn-end delay, and deduplication are
+ * design decisions, not options.
+ */
+export const Config = z.object({
+  /** Toast text language. */
+  language: z.union(['zh', 'en']).default('zh'),
+  /** Play the Windows notification sound. */
+  sound: z.boolean().default(true),
+  /** Announce finished and failed turns; a turn the user cancelled stays silent. */
+  turnEnd: z.boolean().default(true),
+  /** Announce `ask_user_question` requests. */
+  questions: z.boolean().default(true),
+  /** Announce tool calls that wait for the user's approval. */
+  approval: z.boolean().default(true),
+  /** Announce settled background jobs. */
+  jobs: z.boolean().default(true),
+  /** Also announce child (subagent) sessions and their jobs. */
+  childSessions: z.boolean().default(false),
+})
+
+/**
+ * Windows toast script, run through `-EncodedCommand`. The payload arrives as
+ * base64 JSON so no notification text is ever interpolated into PowerShell
+ * source; the title and body are escaped before they enter the XML.
+ */
+const TOAST_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+try {
+  [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+  $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
+  $title = [System.Security.SecurityElement]::Escape([string]$payload.title)
+  $body = [System.Security.SecurityElement]::Escape([string]$payload.body)
+  $silent = ''
+  if (-not $payload.sound) { $silent = '<audio silent="true"/>' }
+  $focused = $false
+  try {
+    Add-Type -Namespace DshNotifyFocus -Name Win32 -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint processId);'
+    $handle = [DshNotifyFocus.Win32]::GetForegroundWindow()
+    if ($handle -ne [System.IntPtr]::Zero) {
+      $foregroundId = 0
+      [void][DshNotifyFocus.Win32]::GetWindowThreadProcessId($handle, [ref]$foregroundId)
+      $foreground = Get-Process -Id $foregroundId -ErrorAction SilentlyContinue
+      if ($null -ne $foreground -and $foreground.ProcessName -eq '${FOCUS_PROCESS_NAME}') { $focused = $true }
+    }
+  } catch { $focused = $false }
+  if (-not $focused) {
+    $document = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $document.LoadXml("<toast activationType='protocol' launch='${ACTIVATION_URL}' duration='short'><visual><binding template='ToastGeneric'><text>$title</text><text>$body</text></binding></visual>$silent</toast>")
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $document
+    foreach ($appId in @(__APP_IDS__)) {
+      try {
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+        break
+      } catch { }
+    }
+  }
+} catch { }
+`
+
+/**
+ * Quote one string as a PowerShell single-quoted literal.
+ * @param value - literal text, possibly containing quotes.
+ * @returns the quoted literal.
+ */
+function quotePowerShell(value) {
+  return `'${String(value).replace(/'/gu, "''")}'`
+}
+
+/**
+ * Build the complete PowerShell command for one toast.
+ * @param payload - base64-encoded UTF-8 JSON payload.
+ * @param appIds - AppUserModelIDs to try in order.
+ * @returns the script source for `-EncodedCommand`.
+ */
+function toastCommand(payload, appIds) {
+  return TOAST_SCRIPT
+    .replace('__PAYLOAD__', payload)
+    .replace('__APP_IDS__', appIds.map(quotePowerShell).join(', '))
+}
+
+/**
+ * Create the notifier the plugin keeps for its whole lifetime.
+ * @param settings - validated plugin settings; only `sound` affects delivery.
+ * @returns `{ send, dispose }`; `send` is synchronous and never throws.
+ */
+function createNotifier(settings) {
+  const children = new Set()
+  /** Most recent delivery time per dedupe key, so a repeated message stays quiet. */
+  const recent = new Map()
+
+  const launch = (command, args) => {
+    try {
+      // Not detached: a DETACHED_PROCESS console keeps PowerShell alive but
+      // makes its WinRT toast silently vanish, and a notifier that outlives the
+      // Host has nothing left to report on.
+      const child = spawn(command, args, {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      children.add(child)
+      child.once('exit', () => children.delete(child))
+      // A missing notifier binary reports here; the notification is simply lost.
+      child.once('error', () => children.delete(child))
+    } catch {
+      // The sender process could not even be spawned; nothing else can observe it.
+    }
+  }
+
+  const deliver = ({ title, body }) => {
+    if (process.platform === 'win32') {
+      const payload = Buffer.from(JSON.stringify({ title, body, sound: settings.sound }), 'utf8').toString('base64')
+      const command = toastCommand(payload, [APP_ID, POWERSHELL_APP_ID])
+      launch('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-WindowStyle',
+        'Hidden',
+        '-EncodedCommand',
+        Buffer.from(command, 'utf16le').toString('base64'),
+      ])
+      return
+    }
+    if (process.platform === 'darwin') {
+      launch('osascript', ['-e', `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`])
+      return
+    }
+    launch('notify-send', ['--app-name=DeepSeek Harness', title, body])
+  }
+
+  return {
+    /**
+     * Deliver one notification unless an identical one was sent within
+     * `DEDUPE_MS`.
+     * @param message - `key` groups repeats, plus the toast title and body.
+     */
+    send(message) {
+      const now = Date.now()
+      const dedupeKey = `${message.key}\u0000${message.title}\u0000${message.body}`
+      const previous = recent.get(dedupeKey)
+      if (previous !== undefined && now - previous < DEDUPE_MS) return
+      recent.set(dedupeKey, now)
+      if (recent.size > 64) {
+        for (const [key, time] of recent) {
+          if (now - time >= DEDUPE_MS) recent.delete(key)
+        }
+      }
+      deliver({ title: message.title, body: message.body })
+    },
+    /** Kill notifier processes still starting, so profile teardown leaves none behind. */
+    dispose() {
+      for (const child of children) {
+        try {
+          child.kill()
+        } catch {
+          // Already exited between the spawn and this teardown.
+        }
+      }
+      children.clear()
+      recent.clear()
+    },
+  }
+}
+
+/**
  * Flatten arbitrary text into one clipped toast line.
  * @param value - text from a session title, a question, or an error.
  * @param limit - maximum character count.
@@ -302,31 +274,14 @@ function clip(value, limit) {
 }
 
 /**
- * Keep only known options with defined values, so a row's omissions keep the
- * documented defaults.
- * @param config - the Loader row's `config` object.
- * @returns the recognized overrides.
- */
-function resolveOptions(config) {
-  const resolved = { ...DEFAULTS }
-  if (config === null || typeof config !== 'object') return resolved
-  for (const [key, value] of Object.entries(config)) {
-    if (key in DEFAULTS && value !== undefined) resolved[key] = value
-  }
-  return resolved
-}
-
-/**
  * Register the notification listeners on the profile's Host context.
  * @param ctx - owning Host context; disposing it removes every listener.
- * @param config - the Loader row's `config` object.
+ * @param settings - validated plugin settings; omitted values fall back to the schema defaults.
  */
-export function apply(ctx, config) {
-  const options = resolveOptions(config)
-  if (!options.enabled) return
-
-  const notifier = createNotifier(options)
+export function apply(ctx, settings) {
+  const options = settings ?? {}
   const messages = MESSAGES[options.language] ?? MESSAGES.zh
+  const notifier = createNotifier({ sound: options.sound ?? true })
   /** Last observed status per session, so only a running → idle edge notifies. */
   const observed = new Map()
   /** Pending announcements, keyed by session, so a follow-up turn cancels one. */
@@ -358,6 +313,7 @@ export function apply(ctx, config) {
   }
 
   const isChild = agent => agent.session?.header?.parentSession !== undefined
+  const includeChildren = options.childSessions ?? false
 
   /**
    * Read the reason the turn just closed with. Every finished turn appends one
@@ -398,7 +354,7 @@ export function apply(ctx, config) {
     })
   }
 
-  if (options.turnEnd) {
+  if (options.turnEnd ?? true) {
     ctx.on('agent/status', ({ agent, status }) => {
       const id = String(agent.id)
       const previous = observed.get(id)
@@ -408,7 +364,7 @@ export function apply(ctx, config) {
         return
       }
       if (status !== 'idle' || previous !== 'running') return
-      if (!options.childSessions && isChild(agent)) return
+      if (!includeChildren && isChild(agent)) return
       const announce = () => {
         pending.delete(id)
         try {
@@ -418,18 +374,14 @@ export function apply(ctx, config) {
           // itself is already finished and must not report an error.
         }
       }
-      if (options.quietMs <= 0) {
-        announce()
-        return
-      }
       cancel(id)
-      const timer = setTimeout(announce, options.quietMs)
+      const timer = setTimeout(announce, QUIET_MS)
       timer.unref?.()
       pending.set(id, timer)
     })
   }
 
-  if (options.questions) {
+  if (options.questions ?? true) {
     // Waterfall: returning `next()` delegates to the profile's own answerer
     // (the Web UI), which is the only party allowed to claim the request.
     ctx.on('user-questions/request', (request, next) => {
@@ -454,10 +406,10 @@ export function apply(ctx, config) {
     })
   }
 
-  if (options.approval) {
+  if (options.approval ?? true) {
     ctx.on('approval/request', (request, next) => {
       try {
-        const reporting = options.childSessions || request.agent === undefined || !isChild(request.agent)
+        const reporting = includeChildren || request.agent === undefined || !isChild(request.agent)
         if (reporting) {
           const displayed = request.displayReason?.[options.language] ?? request.displayReason?.en
           const reason = displayed ?? request.reason
@@ -474,7 +426,7 @@ export function apply(ctx, config) {
     })
   }
 
-  if (options.jobs) {
+  if (options.jobs ?? true) {
     // The runtime exposes job completions as a filtered event stream, not
     // per-listener callbacks: `jobs.events.subscribe({ owners: 'all' }, ...)` is
     // what a profile-level plugin needs to see every session's jobs.
@@ -489,7 +441,7 @@ export function apply(ctx, config) {
           const job = event.job
           const title = messages.jobTitle[job.status]
           if (title === undefined) return
-          if (!options.childSessions && job.owner !== undefined) {
+          if (!includeChildren && job.owner !== undefined) {
             const parent = ctx.get('agents')?.get(job.owner)?.session?.header?.parentSession
             if (parent !== undefined) return
           }
