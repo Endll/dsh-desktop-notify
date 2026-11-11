@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Desktop notifications">
+  <defs>
+    <linearGradient id="dshNotifyFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4D6BFE"/>
+      <stop offset="1" stop-color="#7B5CFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#dshNotifyFill)"/>
+  <path d="M32 13.5c-6.6 0-11.2 4.9-11.2 11.4v6.9l-3.2 5.5c-.9 1.6.2 3.5 2 3.5h24.8c1.8 0 2.9-1.9 2-3.5l-3.2-5.5v-6.9C43.2 18.4 38.6 13.5 32 13.5z" fill="#ffffff"/>
+  <path d="M27.3 44.6a4.9 4.9 0 0 0 9.4 0z" fill="#ffffff"/>
+</svg>

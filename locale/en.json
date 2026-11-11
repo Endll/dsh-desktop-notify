@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Desktop Notifications",
+    "description": "Shows a system notification when a turn finishes, the Agent asks you a question, a tool waits for your approval, or a background job settles."
+  }
+}
